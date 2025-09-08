@@ -28,14 +28,46 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+import cv2
 
+def test_gstreamer_cuda_components():
+    """Test if GStreamer CUDA components are available."""
+    import subprocess
+    try:
+        # Check for NVIDIA GStreamer plugins
+        result = subprocess.run(
+            ["gst-inspect-1.0", "nvv4l2decoder"], 
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False, "nvv4l2decoder not found"
+        
+        result = subprocess.run(
+            ["gst-inspect-1.0", "nvvidconv"], 
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False, "nvvidconv not found"
+            
+        return True, "All CUDA components available"
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False, "GStreamer not available or timeout"
 
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
         return "torchcodec"
+    elif shutil.which("gst-launch-1.0"):  # check if GStreamer is installed
+        # Test CUDA components before using GStreamer
+        cuda_available, msg = test_gstreamer_cuda_components()
+        if cuda_available:
+            logging.info("Using Jetson GStreamer NVDEC backend by default")
+            return "gstreamer"
+        else:
+            logging.warning(f"GStreamer available but CUDA components not ready: {msg}. Falling back to 'pyav'.")
+            return "pyav"
     else:
         logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+            "'torchcodec' is not available, and GStreamer not found. Falling back to 'pyav'."
         )
         return "pyav"
 
@@ -62,6 +94,8 @@ def decode_video_frames(
     """
     if backend is None:
         backend = get_safe_default_codec()
+    elif backend == "gstreamer":
+        return decode_video_frames_gstreamer(video_path, timestamps, tolerance_s)
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
     elif backend in ["pyav", "video_reader"]:
@@ -70,16 +104,118 @@ def decode_video_frames(
         raise ValueError(f"Unsupported video backend: {backend}")
 
 
+def decode_video_frames_gstreamer(
+    video_path: str,
+    timestamps: list[float],
+    tolerance_s: float,
+    log_loaded_timestamps: bool = False,
+) -> torch.Tensor:
+    """
+    Decode frames using Jetson's NVDEC hardware (via GStreamer).
+    Matches requested timestamps with tolerance.
+    Supports H.264, H.265, and other formats with automatic codec detection.
+    """
+    # Detect video format and build appropriate pipeline
+    video_path_str = str(video_path)
+    file_ext = video_path_str.lower().split('.')[-1]
+    
+    if file_ext in ['mp4', 'mov']:
+        # For MP4/MOV files, try H.264 first, then H.265
+        gst_pipeline = (
+            f"filesrc location={video_path_str} ! qtdemux ! "
+            "h264parse ! nvv4l2decoder ! nvvidconv ! "
+            "video/x-raw,format=BGRx ! videoconvert ! appsink"
+        )
+    elif file_ext in ['mkv', 'webm']:
+        # For MKV/WebM files, try H.265 first, then H.264
+        gst_pipeline = (
+            f"filesrc location={video_path_str} ! matroskademux ! "
+            "h265parse ! nvv4l2decoder ! nvvidconv ! "
+            "video/x-raw,format=BGRx ! videoconvert ! appsink"
+        )
+    else:
+        # Generic pipeline that tries to auto-detect
+        gst_pipeline = (
+            f"filesrc location={video_path_str} ! decodebin ! "
+            "nvv4l2decoder ! nvvidconv ! "
+            "video/x-raw,format=BGRx ! videoconvert ! appsink"
+        )
+
+    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        # Try fallback pipeline with decodebin for auto-detection
+        fallback_pipeline = (
+            f"filesrc location={video_path_str} ! decodebin ! "
+            "nvv4l2decoder ! nvvidconv ! "
+            "video/x-raw,format=BGRx ! videoconvert ! appsink"
+        )
+        logging.warning(f"Primary GStreamer pipeline failed, trying fallback: {fallback_pipeline}")
+        cap = cv2.VideoCapture(fallback_pipeline, cv2.CAP_GSTREAMER)
+        
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"Failed to open video with both primary and fallback GStreamer pipelines. "
+                f"Primary: {gst_pipeline}, Fallback: {fallback_pipeline}"
+            )
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        raise RuntimeError("Failed to get FPS from video")
+
+    # Convert timestamps → target frame indices
+    frame_indices = [round(ts * fps) for ts in timestamps]
+    max_idx = max(frame_indices)
+
+    loaded_frames, loaded_ts = [], []
+    current_idx = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if current_idx > max_idx:
+            break
+
+        if current_idx in frame_indices:
+            ts = current_idx / fps
+            tensor_frame = torch.from_numpy(frame[:, :, :3]).permute(2, 0, 1)  # CHW
+            loaded_frames.append(tensor_frame)
+            loaded_ts.append(ts)
+            if log_loaded_timestamps:
+                print(f"Frame loaded at timestamp={ts:.4f}")
+
+        current_idx += 1
+
+    cap.release()
+
+    if not loaded_frames:
+        raise RuntimeError("No frames decoded within requested timestamps")
+
+    # Match closest frames to tolerance
+    query_ts = torch.tensor(timestamps)
+    loaded_ts = torch.tensor(loaded_ts)
+
+    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+
+    is_within_tol = min_ < tolerance_s
+    if not is_within_tol.all():
+        raise ValueError(f"Timestamps outside tolerance: {min_[~is_within_tol]} > {tolerance_s}")
+
+    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_]).float() / 255.0
+    return closest_frames
+
 def decode_video_frames_torchvision(
     video_path: Path | str,
     timestamps: list[float],
     tolerance_s: float,
-    backend: str = "pyav",
+    backend: str = "video_reader",  # Changed default to video_reader for better GPU support
+    device: str = "cuda",  # Added GPU device parameter
     log_loaded_timestamps: bool = False,
 ) -> torch.Tensor:
-    """Loads frames associated to the requested timestamps of a video
+    """Loads frames associated to the requested timestamps of a video with GPU acceleration
 
-    The backend can be either "pyav" (default) or "video_reader".
+    The backend can be either "pyav" or "video_reader" (default).
     "video_reader" requires installing torchvision from source, see:
     https://github.com/pytorch/vision/blob/main/torchvision/csrc/io/decoder/gpu/README.rst
     (note that you need to compile against ffmpeg<4.3)
@@ -96,6 +232,11 @@ def decode_video_frames_torchvision(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
+    # Check CUDA availability
+    if device == "cuda" and not torch.cuda.is_available():
+        logging.warning("CUDA not available, falling back to CPU")
+        device = "cpu"
+    
     video_path = str(video_path)
 
     # set backend
@@ -125,7 +266,10 @@ def decode_video_frames_torchvision(
         current_ts = frame["pts"]
         if log_loaded_timestamps:
             logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
+        
+        # Move frame data to GPU immediately for better performance
+        frame_data = frame["data"].to(device=device, non_blocking=True)
+        loaded_frames.append(frame_data)
         loaded_ts.append(current_ts)
         if current_ts >= last_ts:
             break
@@ -135,10 +279,12 @@ def decode_video_frames_torchvision(
 
     reader = None
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    # Create tensors on the target device for GPU computation
+    query_ts = torch.tensor(timestamps, device=device)
+    loaded_ts = torch.tensor(loaded_ts, device=device)
 
     # compute distances between each query timestamp and timestamps of all loaded frames
+    # This computation now happens on GPU if device="cuda"
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
@@ -152,6 +298,7 @@ def decode_video_frames_torchvision(
         f"\nloaded timestamps: {loaded_ts}"
         f"\nvideo: {video_path}"
         f"\nbackend: {backend}"
+        f"\ndevice: {device}"
     )
 
     # get closest frames to the query timestamps
@@ -162,6 +309,7 @@ def decode_video_frames_torchvision(
         logging.info(f"{closest_ts=}")
 
     # convert to the pytorch format which is float32 in [0,1] range (and channel first)
+    # Keep frames on the target device (GPU if specified)
     closest_frames = closest_frames.type(torch.float32) / 255
 
     assert len(timestamps) == len(closest_frames)
